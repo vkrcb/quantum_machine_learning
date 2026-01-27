@@ -1,0 +1,186 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler
+from qiskit.circuit import QuantumCircuit, Parameter
+from qiskit_machine_learning.algorithms.regressors import VQR
+from qiskit_machine_learning.optimizers import L_BFGS_B
+from qiskit.primitives import Estimator
+from qiskit_machine_learning.neural_networks import EstimatorQNN
+
+# Set Roman (serif) font for all plots
+plt.rcParams['font.family'] = 'serif'
+# data directory
+battery_dir = "/home/ashok/Documents/battery_alt_dataset/battery_alt_dataset/regular_alt_batteries"
+
+subplot_info = [
+    {"label": "9.3A", "files": ["battery01.csv", "battery11.csv"], "kwh": 4},
+    {"label": "9.3A", "files": ["battery01.csv", "battery11.csv"], "kwh": 6},
+    {"label": "9.3A", "files": ["battery01.csv", "battery11.csv"], "kwh": 8},
+    {"label": "12.9A", "files": ["battery31.csv", "battery22.csv"], "kwh": 3},
+    {"label": "12.9A", "files": ["battery31.csv", "battery22.csv"], "kwh": 4},
+    {"label": "12.9A", "files": ["battery31.csv", "battery22.csv"], "kwh": 5},
+    {"label": "12.9–16A", "files": ["battery41.csv", "battery51.csv"], "kwh": 3},
+    {"label": "12.9–16A", "files": ["battery41.csv", "battery51.csv"], "kwh": 4},
+    {"label": "12.9–16A", "files": ["battery41.csv", "battery51.csv"], "kwh": 5},
+]
+# Extract cycles from the DataFrame
+def extract_cycles(df):
+    df = df[df['mode'] == -1].copy()
+    df = df[(df['voltage_load'] > 0) & (df['current_load'].abs() >= 0)].dropna(subset=['voltage_load', 'current_load'])
+    if df.empty:
+        return []
+    is_new_cycle = (df['time'].diff() < 0) | (df['time'].diff() > 100)
+    df['cycle'] = is_new_cycle.cumsum()
+    cycles = []
+    cum_energy = 0.0
+    # Group by cycle and calculate cumulative energy
+    for _, group in df.groupby('cycle'):
+        time = group['time'].values - group['time'].values[0]
+        voltage = group['voltage_load'].values
+        current = np.abs(group['current_load'].values)
+        dt = np.diff(group['time'].values, prepend=group['time'].values[0])
+        power = voltage * current
+        energy = np.sum(power * dt) / 3600000
+        cum_energy += energy
+        if len(time) > 10 and (time[-1] > 50):
+            cycles.append({
+                'time': time,
+                'voltage': voltage,
+                'current': current,
+                'cum_energy': cum_energy,
+                'energy': energy,
+                'group': group
+            })
+    return cycles
+# Calculate maximum charge capacity (Qmax) in Ah for a cycle
+def calc_qmax(cycle):
+    dt = np.diff(cycle['group']['time'].values, prepend=cycle['group']['time'].values[0])
+    current = np.abs(cycle['group']['current_load'].values)
+    q_ah = np.sum(current * dt) / 3600
+    return q_ah
+# Prepare subplots
+fig, axes = plt.subplots(3, 3, figsize=(20, 16), sharex=False)
+axes = axes.flatten()
+overall_metrics = {}
+# Iterate through each subplot info
+for idx, info in enumerate(subplot_info):
+    ax = axes[idx]
+    energies, qmaxs = [], []
+    for fname in info["files"]:
+        path = os.path.join(battery_dir, fname)
+        if not os.path.exists(path):
+            continue
+
+        # Read the CSV file
+        df = pd.read_csv(path, low_memory=False)
+        cycles = extract_cycles(df)
+        first_qmax = None
+
+        for cyc in cycles:
+            if cyc['cum_energy'] > info['kwh']:
+                break
+            q = calc_qmax(cyc)
+            if first_qmax is None:
+                first_qmax = q
+            energies.append(cyc['cum_energy'])
+            qmaxs.append(q / first_qmax if first_qmax else 1)
+    if len(energies) == 0:
+        continue
+
+    # 1. Feature and target setup
+    X = np.array(energies).reshape(-1, 1)
+    y = np.array(qmaxs).reshape(-1, 1)
+    mask = ~np.isnan(y).flatten()
+    X = X[mask]
+    y = y[mask]
+    sort_idx = np.argsort(X.flatten())
+    X = X[sort_idx]
+    y = y[sort_idx]
+
+    if len(X) > 2:
+        # Ground truth curve (polyfit)
+        poly = np.poly1d(np.polyfit(X.flatten(), y.flatten(), 2))
+        x_dense = np.linspace(X.min(), X.max(), 200).reshape(-1, 1)
+        y_true = poly(x_dense.flatten())
+        ax.plot(x_dense, y_true, '-', color='tab:blue', linewidth=2.5, label="True value")
+
+        # Scaling
+        scaler_X = MinMaxScaler()
+        scaler_y = MinMaxScaler()
+        X_scaled = scaler_X.fit_transform(X)
+        y_scaled = scaler_y.fit_transform(y)
+
+        X_train, X_test, y_train, y_test = train_test_split(X_scaled, y_scaled, test_size=0.2, random_state=42)
+
+        # Feature map and ansatz
+        param_x1 = Parameter("x1")
+        param_x2 = Parameter("x2")
+        feature_map = QuantumCircuit(3)
+        feature_map.ry(param_x1, 1)
+        feature_map.ry(param_x2, 2)
+        feature_map.cx(0, 1)
+
+        param_y1 = Parameter("y1")
+        param_y2 = Parameter("y2")
+        ansatz = QuantumCircuit(3)
+        ansatz.ry(param_y1, 1)
+        ansatz.ry(param_y2, 2)
+        ansatz.cx(0, 1)
+
+        # define estimator
+        estimator = Estimator()
+        # Using VQR to create a quantum neural network
+        vqr = VQR(
+            feature_map=feature_map,
+            ansatz=ansatz,
+            optimizer=L_BFGS_B(maxiter=200),
+            estimator=estimator,
+        )
+        # Ensure 2D input for 2 features
+        if X_train.shape[1] == 1:
+            X_train_2d = np.hstack([X_train, np.zeros_like(X_train)])
+            X_test_2d = np.hstack([X_test, np.zeros_like(X_test)])
+            x_dense_2d = np.hstack([scaler_X.transform(x_dense), np.zeros_like(x_dense)])
+        else:
+            X_train_2d = X_train
+            X_test_2d = X_test
+            x_dense_2d = scaler_X.transform(x_dense)
+        # Fit the regressor
+        vqr.fit(X_train_2d, y_train.ravel())
+        y_pred_dense_scaled = vqr.predict(x_dense_2d).flatten()
+        y_pred_dense = scaler_y.inverse_transform(y_pred_dense_scaled.reshape(-1, 1)).flatten()
+
+        y_test_pred = vqr.predict(X_test_2d).flatten()
+        y_test_real = scaler_y.inverse_transform(y_test.reshape(-1, 1)).flatten()
+        y_test_pred_real = scaler_y.inverse_transform(y_test_pred.reshape(-1, 1)).flatten()
+        # Plot predictions
+        pred_std = np.std(y_test_real - y_test_pred_real)
+        lower = y_pred_dense - 1.96 * pred_std
+        upper = y_pred_dense + 1.96 * pred_std
+
+        ax.plot(x_dense, y_pred_dense, '--', color='red', linewidth=2, label="VQR Prediction")
+        ax.fill_between(x_dense.flatten(), lower, upper, color='red', alpha=0.2)
+
+        mae = mean_absolute_error(y_test_real, y_test_pred_real)
+        rmse = np.sqrt(mean_squared_error(y_test_real, y_test_pred_real))
+        r2 = r2_score(y_test_real, y_test_pred_real)
+        overall_metrics[(info['label'], info['kwh'])] = (mae, rmse, r2)
+        ax.set_title(f"{info['label']} ({info['kwh']} kWh)\nMAE={mae:.3f}, RMSE={rmse:.3f}, R²={r2:.3f}", fontsize=11, fontweight='bold')
+    else:
+        ax.plot(X, y, '-', color='blue', linewidth=2)
+        ax.set_title(f"{info['label']} ({info['kwh']} kWh)", fontsize=12, fontweight='bold')
+
+    # Axis settings
+    ax.set_xlabel(r"Cumulative energy [kWh]", fontsize=13, fontweight='bold')
+    ax.set_ylabel(r"$q_{\mathrm{max}}$ ( )", fontsize=13, fontweight='bold')
+    ax.tick_params(axis='both', labelsize=12)
+    ax.grid(True, linestyle='--', alpha=0.6)
+    ax.legend()
+
+plt.tight_layout()
+plt.subplots_adjust(top=0.93)
+plt.show()

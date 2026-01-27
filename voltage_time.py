@@ -1,0 +1,204 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler
+from qiskit.circuit import QuantumCircuit, Parameter
+from qiskit_machine_learning.neural_networks import EstimatorQNN
+from qiskit_machine_learning.algorithms.regressors import VQR
+from qiskit_machine_learning.optimizers import L_BFGS_B
+from qiskit.primitives import Estimator
+from scipy.signal import savgol_filter
+from scipy.interpolate import interp1d
+from matplotlib.font_manager import FontProperties
+
+# === Set Global Roman Bold Style for All Text Elements ===
+plt.rcParams['font.family'] = 'Times New Roman'
+plt.rcParams['font.weight'] = 'bold'
+plt.rcParams['xtick.labelsize'] = 12
+plt.rcParams['ytick.labelsize'] = 12
+
+# === Roman Bold FontProperties for Titles and Legends ===
+roman_bold = FontProperties(family='Times New Roman', weight='bold')
+# data directory
+battery_dir = "/home/ashok/Documents/battery_alt_dataset/battery_alt_dataset/regular_alt_batteries"
+
+subplot_info = [
+    {"label": "9.3A", "files": ["battery01.csv", "battery11.csv"], "kwh": 4},
+    {"label": "9.3A", "files": ["battery01.csv", "battery11.csv"], "kwh": 6},
+    {"label": "9.3A", "files": ["battery01.csv", "battery11.csv"], "kwh": 8},
+    {"label": "12.9A", "files": ["battery31.csv", "battery22.csv"], "kwh": 3},
+    {"label": "12.9A", "files": ["battery31.csv", "battery22.csv"], "kwh": 4},
+    {"label": "12.9A", "files": ["battery31.csv", "battery22.csv"], "kwh": 5},
+    {"label": "12.9–16A", "files": ["battery41.csv", "battery51.csv"], "kwh": 3},
+    {"label": "12.9–16A", "files": ["battery41.csv", "battery51.csv"], "kwh": 4},
+    {"label": "12.9–16A", "files": ["battery41.csv", "battery51.csv"], "kwh": 5},
+]
+
+# Function to extract cycles from the DataFrame
+
+def extract_cycles(df):
+    df = df[df['mode'] == -1].copy()
+    df = df[(df['voltage_load'] > 0) & (df['current_load'].abs() >= 0)]
+    df = df.dropna(subset=['voltage_load', 'current_load'])
+    if df.empty:
+        return []
+    is_new_cycle = (df['time'].diff() < 0) | (df['time'].diff() > 100)
+    df['cycle'] = is_new_cycle.cumsum()
+    cycles = []
+    cum_energy = 0.0
+    # Group by cycle and calculate energy and other metrics
+    for _, group in df.groupby('cycle'):
+        time = group['time'].values - group['time'].values[0]
+        voltage = group['voltage_load'].values
+        current = np.abs(group['current_load'].values)
+        dt = np.diff(group['time'].values, prepend=group['time'].values[0])
+        power = voltage * current
+        energy = np.sum(power * dt) / 3600000
+        cum_energy += energy
+        if len(time) > 10 and (time[-1] > 50):
+            cycles.append({'time': time, 'voltage': voltage, 'current': current, 'cum_energy': cum_energy})
+    return cycles
+# Function to find the cycle closest to the target kWh
+def find_cycle(cycles, target_kwh, tol=0.8):
+    for cyc in cycles:
+        if abs(cyc['cum_energy'] - target_kwh) < tol:
+            return cyc
+    if cycles:
+        return min(cycles, key=lambda c: abs(c['cum_energy'] - target_kwh))
+    return None
+# Function to get the discharge segment of a cycle
+def get_discharge_segment(time, voltage, current):
+    start_idx = np.argmax((current > 0.5) & (voltage < 8.2))
+    end_idx = np.argmax(voltage < 5)
+    if end_idx == 0:
+        end_idx = len(voltage)
+    if end_idx - start_idx < 10:
+        return np.array([]), np.array([]), np.array([])
+    return time[start_idx:end_idx], voltage[start_idx:end_idx], current[start_idx:end_idx]
+
+# === Main Plotting ===
+fig, axes = plt.subplots(3, 3, figsize=(18, 12))
+axes = axes.flatten()
+metrics_all = []
+
+for idx, info in enumerate(subplot_info):
+    X_all, y_all = [], []
+    for fname in info['files'][:1]:
+        path = os.path.join(battery_dir, fname)
+        if not os.path.exists(path):
+            continue
+        df = pd.read_csv(path)
+        cycles = extract_cycles(df)
+        cyc = find_cycle(cycles, info['kwh'])
+        if cyc:
+            t, v, c = get_discharge_segment(cyc['time'], cyc['voltage'], cyc['current'])
+            if len(t) > 1:
+                for ti, vi, ci in zip(t, v, c):
+                    X_all.append([ti, ci, cyc['cum_energy']]) # feature: time, current, cumulative energy
+                    y_all.append(vi) # target: voltage
+
+    if len(X_all) < 20:
+        continue
+  # Convert lists to numpy arrays
+    X = np.array(X_all)
+    y = np.array(y_all)
+    # Scale features and target variable
+    x_scaler = MinMaxScaler()
+    y_scaler = MinMaxScaler()
+    # Split data into training and test sets
+    X_scaled = x_scaler.fit_transform(X)
+    y_scaled = y_scaler.fit_transform(y.reshape(-1, 1)).flatten()
+    X_train, X_test, y_train, y_test = train_test_split(X_scaled, y_scaled, test_size=0.2, random_state=42)
+
+    # === Quantum Circuit ===
+    # Define the quantum circuit for the regression model
+    # Feature map and ansatz
+    param_x1 = Parameter("x1")
+    param_x2 = Parameter("x2")
+    param_x3 = Parameter("x3")
+    feature_map = QuantumCircuit(3, name="fm")
+    feature_map.ry(param_x1, 0)
+    feature_map.ry(param_x2, 1)
+    feature_map.ry(param_x3, 2)
+    param_y1 = Parameter("y1")
+    param_y2 = Parameter("y2")
+    param_y3 = Parameter("y3")
+    ansatz = QuantumCircuit(3, name="vf")
+    ansatz.ry(param_y1, 0)
+    ansatz.ry(param_y2, 1)
+    ansatz.ry(param_y3, 2)
+    qc = feature_map.compose(ansatz)
+
+    # define estimator
+    estimator = Estimator()
+    # variational quantum regressor
+    vqr = VQR(
+        feature_map=feature_map,
+        ansatz=ansatz,
+        optimizer=L_BFGS_B(maxiter=200),
+        estimator=estimator,
+    )
+    # Fit the regressor on the training set
+    vqr.fit(X_train, y_train)
+    # ===== CI ADD START (ONLY ADDITION) =====
+    y_train_pred = vqr.predict(X_train)
+    y_train_pred_rescaled = y_scaler.inverse_transform(y_train_pred.reshape(-1, 1)).flatten()
+    y_train_rescaled = y_scaler.inverse_transform(y_train.reshape(-1, 1)).flatten()
+    sigma = np.std(y_train_rescaled - y_train_pred_rescaled)
+    z = 1.96
+    # ===== CI ADD END =====
+
+    y_pred_scaled = vqr.predict(X_test)
+    y_pred = y_scaler.inverse_transform(y_pred_scaled.reshape(-1, 1)).flatten()
+    y_true = y_scaler.inverse_transform(y_test.reshape(-1, 1)).flatten()
+
+    mae = mean_absolute_error(y_true, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    r2 = r2_score(y_true, y_pred)
+    metrics_all.append((info['label'], info['kwh'], mae, rmse, r2))
+
+    ax = axes[idx]
+
+    t_smooth = np.linspace(X[:, 0].min(), X[:, 0].max(), 300)
+    f_current = interp1d(X[:, 0], X[:, 1], kind='linear', fill_value='extrapolate')
+    f_energy = interp1d(X[:, 0], X[:, 2], kind='linear', fill_value='extrapolate')
+
+    X_smooth = np.array([[t, f_current(t), f_energy(t)] for t in t_smooth])
+    X_smooth_scaled = x_scaler.transform(X_smooth)
+    y_smooth_scaled = vqr.predict(X_smooth_scaled)
+    y_smooth = y_scaler.inverse_transform(y_smooth_scaled.reshape(-1, 1)).flatten()
+    y_smooth = savgol_filter(y_smooth, 11, 3)
+
+    upper = y_smooth + z * sigma
+    lower = y_smooth - z * sigma
+
+    ax.plot(X[:, 0], y, color='gray', label='True', lw=1.5)
+    ax.plot(t_smooth, y_smooth, color='tab:orange', label='VQR Prediction', lw=2)
+    ax.fill_between(t_smooth, lower, upper, color='tab:orange', alpha=0.25)
+
+    ax.set_title(
+    f"{info['label']} ({info['kwh']} kWh)\n"
+    f"Test MAE={mae:.3f}, RMSE={rmse:.3f}, R²={r2:.3f}",
+    fontproperties=roman_bold
+    )
+
+    ax.set_xlabel("Time [s]", fontsize=13, fontproperties=roman_bold)
+    ax.set_ylabel("Voltage [V]", fontsize=13, fontproperties=roman_bold)
+
+    for label in ax.get_xticklabels() + ax.get_yticklabels():
+        label.set_fontproperties(roman_bold)
+
+    ax.grid(True)
+    ax.legend(prop=roman_bold)
+
+plt.tight_layout()
+plt.subplots_adjust(top=0.90)
+plt.show()
+
+print("\n--- QNN Metrics Per Battery Condition ---")
+print(f"{'Label':<12} {'kWh':<5} {'MAE':<8} {'RMSE':<8} {'R²':<8}")
+for label, kwh, mae, rmse, r2 in metrics_all:
+    print(f"{label:<12} {kwh:<5} {mae:<8.3f} {rmse:<8.3f} {r2:<8.3f}")
