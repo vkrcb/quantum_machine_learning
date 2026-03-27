@@ -1,0 +1,234 @@
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import statsmodels.api as sm
+from scipy import stats
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import KFold
+from sklearn.metrics import mean_absolute_error
+from qiskit_machine_learning.optimizers import L_BFGS_B
+from qiskit_machine_learning.neural_networks import EstimatorQNN
+from qiskit_machine_learning.algorithms import VQR, NeuralNetworkRegressor
+from qiskit.primitives import Estimator
+from qiskit.circuit import Parameter, QuantumCircuit
+from matplotlib.font_manager import FontProperties
+
+# === Global Styles ===
+plt.rcParams['font.family'] = 'Times New Roman'
+plt.rcParams['font.weight'] = 'bold'
+roman_bold = FontProperties(family='Times New Roman', weight='bold', size=12)
+
+# CONFIG
+DATA_DIR = '/home/ashok/Documents/battery_alt_dataset/battery_alt_dataset/regular_alt_batteries'
+
+battery_map = {
+    '9.3A': ['battery01.csv', 'battery11.csv'],
+    '12.9A': ['battery31.csv', 'battery22.csv'],
+    '14.3A': ['battery23.csv', 'battery52.csv'],
+    '16.0A': ['battery00.csv', 'battery10.csv'],
+    '19.0A': ['battery20.csv', 'battery30.csv']
+}
+
+# ===== GLOBAL STORAGE (IMPORTANT) =====
+global_vqr = []
+global_qnn = []
+
+# --- Data Processing ---
+results = []
+initial_capacities = []
+
+for current_label, battery_files in battery_map.items():
+    for file in battery_files:
+        path = os.path.join(DATA_DIR, file)
+        if not os.path.exists(path): continue
+
+        df = pd.read_csv(path)
+        df = df[df['mode'] == -1].copy()
+        df = df.sort_values('time').reset_index(drop=True)
+
+        df['time_diff'] = df['time'].diff().fillna(0)
+        df['cycle'] = (df['time_diff'] > 60).cumsum()
+
+        cumulative_energy = 0
+        first_valid_capacity = None
+
+        def compute_metrics(group):
+            t = group['time'].values
+            I = group['current_load'].values
+            V = group['voltage_load'].values
+            return np.trapz(V * I, t)/3600/1000, np.trapz(I, t)/3600
+
+        for _, group in df.groupby('cycle'):
+            if len(group) < 10: continue
+            energy, capacity = compute_metrics(group)
+
+            if (group['time'].iloc[-1] - group['time'].iloc[0]) < 300:
+                continue
+
+            if first_valid_capacity is None:
+                first_valid_capacity = capacity
+                initial_capacities.append(capacity)
+
+            cumulative_energy += energy
+
+            results.append({
+                'current': current_label,
+                'cumulative_energy': cumulative_energy,
+                'capacity': capacity,
+                'initial_capacity': first_valid_capacity
+            })
+
+mean_initial_capacity = np.mean(initial_capacities)
+results_df = pd.DataFrame(results)
+
+cleaned_dfs = []
+for current in battery_map.keys():
+    df_sub = results_df[results_df['current'] == current].sort_values('cumulative_energy').reset_index(drop=True)
+
+    df_sub['capacity_aligned'] = df_sub['capacity'] - df_sub['initial_capacity'] + mean_initial_capacity
+
+    frac = 0.25 if current in ['16.0A', '19.0A'] else 0.12
+    smoothed = sm.nonparametric.lowess(df_sub['capacity_aligned'], df_sub['cumulative_energy'], frac=frac)
+
+    df_sub['capacity_smooth'] = smoothed[:, 1]
+    cleaned_dfs.append(df_sub)
+
+# === Plot setup ===
+fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+axes = axes.flatten()
+
+kf = KFold(n_splits=20, shuffle=True, random_state=42)
+estimator_instance = Estimator()
+
+# ================= MODEL LOOP =================
+for idx, df_sub in enumerate(cleaned_dfs):
+
+    current_label = df_sub['current'].iloc[0]
+    ax = axes[idx]
+
+    X = df_sub[['cumulative_energy']].assign(curr=float(current_label.replace('A',''))).values
+    y = df_sub['capacity_smooth'].values
+
+    mae_vqr_all_folds = []
+    mae_qnn_all_folds = []
+
+    print(f"\n>>> Processing {current_label} <<<")
+
+    for train_idx, test_idx in kf.split(X):
+
+        y_test = y[test_idx]
+
+        scaler_x = MinMaxScaler((-1,1))
+        scaler_y = MinMaxScaler((-1,1))
+
+        X_train_sc = scaler_x.fit_transform(X[train_idx])
+        X_test_sc = scaler_x.transform(X[test_idx])
+
+        y_train_sc = scaler_y.fit_transform(y[train_idx].reshape(-1,1)).flatten()
+
+        p_x1, p_x2 = Parameter("x1"), Parameter("x2")
+        p_y1, p_y2 = Parameter("y1"), Parameter("y2")
+
+        fm = QuantumCircuit(2)
+        fm.ry(p_x1, 0)
+        fm.ry(p_x2, 1)
+
+        ans = QuantumCircuit(2)
+        ans.ry(p_y1, 0)
+        ans.ry(p_y2, 1)
+
+        # ===== VQR =====
+        vqr = VQR(feature_map=fm, ansatz=ans,
+                  optimizer=L_BFGS_B(maxiter=200),
+                  estimator=estimator_instance)
+
+        vqr.fit(X_train_sc, y_train_sc)
+
+        p_vqr = scaler_y.inverse_transform(
+            vqr.predict(X_test_sc).reshape(-1,1)
+        ).flatten()
+
+        mae_vqr_all_folds.append(mean_absolute_error(y_test, p_vqr))
+
+        # ===== QNN =====
+        qnn_qc = fm.compose(ans)
+
+        qnn = EstimatorQNN(
+            circuit=qnn_qc,
+            input_params=[p_x1, p_x2],
+            weight_params=[p_y1, p_y2],
+            estimator=estimator_instance
+        )
+
+        reg = NeuralNetworkRegressor(
+            neural_network=qnn,
+            optimizer=L_BFGS_B(maxiter=200)
+        )
+
+        reg.fit(X_train_sc, y_train_sc)
+
+        p_qnn = scaler_y.inverse_transform(
+            reg.predict(X_test_sc).reshape(-1,1)
+        ).flatten()
+
+        mae_qnn_all_folds.append(mean_absolute_error(y_test, p_qnn))
+
+    # ===== GLOBAL ADD =====
+    global_vqr.extend(mae_vqr_all_folds)
+    global_qnn.extend(mae_qnn_all_folds)
+
+    # ===== LOCAL T-TEST =====
+    t_stat, p_val = stats.ttest_rel(mae_vqr_all_folds, mae_qnn_all_folds)
+
+    bp = ax.boxplot([mae_vqr_all_folds, mae_qnn_all_folds],
+                    labels=['VQR', 'QNN'], patch_artist=True)
+
+    for patch, color in zip(bp['boxes'], ['#3498db', '#e67e22']):
+        patch.set_facecolor(color)
+
+    ax.set_title(f'Current: {current_label}', fontproperties=roman_bold)
+    ax.set_ylabel('MAE', fontproperties=roman_bold)
+
+    if p_val < 0.05:
+        ax.text(1.5, max(mae_vqr_all_folds+mae_qnn_all_folds),
+                'Significant', color='red', ha='center', weight='bold')
+
+# cleanup
+if len(axes) > len(cleaned_dfs):
+    for i in range(len(cleaned_dfs), len(axes)):
+        fig.delaxes(axes[i])
+
+plt.tight_layout()
+plt.show()
+
+# ================= GLOBAL STATISTICS =================
+print("\n=========== GLOBAL RESULT ===========")
+
+global_vqr = np.array(global_vqr)
+global_qnn = np.array(global_qnn)
+
+# T-test
+t_stat_g, p_val_g = stats.ttest_rel(global_vqr, global_qnn)
+
+# Cohen's d
+def cohens_d(x, y):
+    diff = x - y
+    return np.mean(diff) / np.std(diff, ddof=1)
+
+d_val = cohens_d(global_vqr, global_qnn)
+
+# Wilcoxon
+w_stat, p_w = stats.wilcoxon(global_vqr, global_qnn)
+
+# FINAL PRINT
+print(f"VQR Mean MAE: {np.mean(global_vqr):.5f}")
+print(f"QNN Mean MAE: {np.mean(global_qnn):.5f}")
+print(f"T-test p-value: {p_val_g:.5f}")
+print(f"Cohen's d: {d_val:.4f}")
+print(f"Wilcoxon p-value: {p_w:.5f}")
+
+if p_val_g > 0.05:
+    print("NOT statistically significant")
+else:
+    print("Statistically significant")
