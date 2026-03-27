@@ -1,0 +1,168 @@
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import statsmodels.api as sm
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from qiskit_machine_learning.optimizers import L_BFGS_B
+from qiskit_machine_learning.algorithms import VQR
+from qiskit.primitives import Estimator
+from qiskit.circuit import Parameter, QuantumCircuit
+from scipy.interpolate import interp1d
+from matplotlib.font_manager import FontProperties
+
+# === Style ===
+plt.rcParams['font.family'] = 'Times New Roman'
+plt.rcParams['font.weight'] = 'bold'
+plt.rcParams['xtick.labelsize'] = 12
+plt.rcParams['ytick.labelsize'] = 12
+roman_bold = FontProperties(family='Times New Roman', weight='bold')
+
+# === Config ===
+DATA_DIR = '/home/ashok/Documents/battery_alt_dataset/battery_alt_dataset/regular_alt_batteries'
+battery_map = {
+    '9.3A': ['battery01.csv', 'battery11.csv'],
+    '12.9A': ['battery31.csv', 'battery22.csv'],
+    '14.3A': ['battery23.csv', 'battery52.csv'],
+    '16.0A': ['battery00.csv', 'battery10.csv'],
+    '19.0A': ['battery20.csv', 'battery30.csv']
+}
+color_list = ['tab:blue', 'tab:orange', 'tab:green', 'tab:red', 'tab:purple']
+ci_alpha = 0.18
+
+def compute_metrics(df):
+    t = df['time'].values
+    I = df['current_load'].values
+    V = df['voltage_load'].values
+    energy = np.trapz(V * I, t) / 3600 / 1000  # kWh
+    capacity = np.trapz(I, t) / 3600           # Ah
+    return energy, capacity
+
+# === Preprocess ===
+results = []
+initial_capacities = []
+for current_label, battery_files in battery_map.items():
+    for file in battery_files:
+        df = pd.read_csv(os.path.join(DATA_DIR, file))
+        df = df[df['mode'] == -1].copy().sort_values('time').reset_index(drop=True)
+        df['time_diff'] = df['time'].diff().fillna(0)
+        df['cycle'] = (df['time_diff'] > 60).cumsum()
+        cumulative_energy = 0
+        first_valid_capacity = None
+        for _, group in df.groupby('cycle'):
+            if len(group) < 10: continue
+            energy, capacity = compute_metrics(group)
+            if capacity < 0.1 or energy < 0.001: continue
+            if group['voltage_load'].max() - group['voltage_load'].min() < 0.2: continue
+            if first_valid_capacity is None:
+                first_valid_capacity = capacity
+                initial_capacities.append(first_valid_capacity)
+            cumulative_energy += energy
+            results.append({
+                'current': current_label,
+                'cumulative_energy': cumulative_energy,
+                'capacity': capacity,
+                'initial_capacity': first_valid_capacity
+            })
+
+mean_initial_capacity = np.mean(initial_capacities)
+results_df = pd.DataFrame(results)
+
+cleaned_dfs = []
+for current in results_df['current'].unique():
+    df_sub = results_df[results_df['current'] == current].sort_values('cumulative_energy').reset_index(drop=True)
+    df_sub = df_sub[df_sub['cumulative_energy'].diff().fillna(1) > 0]
+    df_sub['capacity_aligned'] = df_sub['capacity'] - df_sub['initial_capacity'] + mean_initial_capacity
+    frac = 0.25 if current in ['16.0A','19.0A'] else 0.12
+    smoothed = sm.nonparametric.lowess(df_sub['capacity_aligned'], df_sub['cumulative_energy'], frac=frac)
+    df_sub['capacity_smooth'] = smoothed[:,1]
+    cleaned_dfs.append(df_sub)
+
+# === Plot capacity vs energy ===
+fig, ax = plt.subplots(figsize=(10,6))
+r2_table = {}
+convergence_histories = {}
+
+for idx, df_sub in enumerate(cleaned_dfs):
+    current = df_sub['current'].iloc[0]
+    color = color_list[idx % len(color_list)]
+    df_vqr = df_sub.copy().reset_index(drop=True)
+    df_vqr['cycle'] = df_vqr.index.values
+    df_vqr['current_numeric'] = df_vqr['current'].str.replace('A','').astype(float)
+
+    X = df_vqr[['cumulative_energy','current_numeric']].values
+    y = df_vqr['capacity_smooth'].values
+
+    # Split
+    split = int(0.8*len(X))
+    X_train, X_test = X[:split], X[split:]
+    y_train, y_test = y[:split], y[split:]
+
+    scaler = MinMaxScaler((-1,1))
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+    yscaler = MinMaxScaler((-1,1))
+    y_train_scaled = yscaler.fit_transform(y_train.reshape(-1,1)).flatten()
+    y_test_scaled = yscaler.transform(y_test.reshape(-1,1)).flatten()
+
+    # Quantum circuit
+    param_x1,param_x2 = Parameter("x1"),Parameter("x2")
+    param_y1,param_y2 = Parameter("y1"),Parameter("y2")
+    fm = QuantumCircuit(2); fm.ry(param_x1,0); fm.ry(param_x2,1)
+    ansatz = QuantumCircuit(2); ansatz.ry(param_y1,0); ansatz.ry(param_y2,1)
+    estimator = Estimator()
+    vqr = VQR(feature_map=fm, ansatz=ansatz,
+              optimizer=L_BFGS_B(maxiter=200),
+              estimator=estimator)
+
+    # Fit
+    vqr.fit(X_train_scaled,y_train_scaled)
+
+    # Predictions
+    y_train_pred_scaled = vqr.predict(X_train_scaled)
+    y_train_pred = yscaler.inverse_transform(y_train_pred_scaled.reshape(-1,1)).flatten()
+    y_test_pred_scaled = vqr.predict(X_test_scaled)
+    y_test_pred = yscaler.inverse_transform(y_test_pred_scaled.reshape(-1,1)).flatten()
+
+    # Metrics
+    r2_table[current] = (r2_score(y_train,y_train_pred), r2_score(y_test,y_test_pred))
+
+    # Plot capacity curves
+    ax.plot(df_vqr['cumulative_energy'], df_vqr['capacity_smooth'],
+            color=color, linestyle='-', linewidth=4, label=f"{current}")
+    ax.plot(X_test[:,0], y_test_pred, color=color, linestyle='--', linewidth=2)
+
+    # --- Convergence tracking (simulate incremental error) ---
+    losses = []
+    for i in range(1,len(X_train_scaled)+1):
+        y_pred_partial = vqr.predict(X_train_scaled[:i])
+        mse = mean_squared_error(y_train_scaled[:i], y_pred_partial)
+        losses.append(mse)
+    convergence_histories[current] = losses
+
+# Format plot
+ax.set_xlabel("Cumulative energy [kWh]", fontsize=13)
+ax.set_ylabel("Capacity [Ah]", fontsize=13)
+ax.tick_params(axis='both', labelsize=12)
+ax.grid(True, linestyle='--', alpha=0.7)
+ax.legend(fontsize=12, ncol=2, prop=roman_bold)
+plt.tight_layout()
+plt.show()
+
+# Print R² table
+print("| Current | Train R2 | Test R2 |")
+for k,(r2tr,r2te) in r2_table.items():
+    print(f"| {k:>6} | {r2tr:7.4f} | {r2te:7.4f} |")
+
+# === Convergence Plot ===
+plt.figure(figsize=(8,6))
+for current,losses in convergence_histories.items():
+    plt.plot(range(1,len(losses)+1), losses, label=f"{current}", linewidth=5)
+plt.xlabel("Training Iteration", fontweight="bold")
+plt.ylabel("Training Error (MSE)", fontweight="bold")
+plt.title("Parameter Convergence Plot", fontweight="bold")
+plt.legend()
+plt.grid(True, linestyle="--", alpha=0.9)
+plt.tight_layout()
+plt.show()
