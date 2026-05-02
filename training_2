@@ -1,0 +1,193 @@
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.interpolate import interp1d
+from scipy.ndimage import uniform_filter1d
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.decomposition import PCA
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error
+
+from qiskit import QuantumCircuit
+from qiskit.circuit import Parameter
+from qiskit.primitives import Estimator
+from qiskit_machine_learning.algorithms import VQR
+from qiskit_machine_learning.optimizers import L_BFGS_B
+
+# ================= STYLE =================
+plt.rcParams['font.family'] = 'serif'
+plt.rcParams['font.serif'] = ['Times New Roman']
+
+# ================= DATA =================
+base_path = "/home/ashok/Documents/battery_alt_dataset/battery_alt_dataset/regular_alt_batteries"
+
+battery_map = {
+    '9.3A': ['battery01.csv', 'battery11.csv'],
+    '12.9A': ['battery31.csv', 'battery22.csv'],
+    '14.3A': ['battery23.csv', 'battery52.csv'],
+    '16.0A': ['battery00.csv', 'battery10.csv'],
+    '19.0A': ['battery20.csv', 'battery30.csv']
+}
+
+NUM_POINTS = 30000
+CUTOFF_VOLTAGE = 5
+
+all_features = []
+all_targets = []
+labels = []
+
+# ================= DATA PROCESS =================
+for current, files in battery_map.items():
+    interpolated_voltages = []
+    min_cycle_duration = np.inf
+
+    for file in files:
+        df = pd.read_csv(os.path.join(base_path, file))
+
+        df_discharge = df[(df["mode"] == -1) &
+                          (df["voltage_load"] > 5) &
+                          (df["voltage_load"] < 8.4)].copy()
+
+        df_discharge["cycle"] = (df_discharge["time"].diff() > 10).cumsum()
+
+        for i in range(4):
+            cycle = df_discharge[df_discharge["cycle"] == i].copy()
+
+            if len(cycle) > 10:
+                cycle["time"] -= cycle["time"].min()
+                cycle = cycle.sort_values("time")
+
+                duration = cycle["time"].max()
+                min_cycle_duration = min(min_cycle_duration, duration)
+
+                f = interp1d(cycle["time"], cycle["voltage_load"], fill_value="extrapolate")
+                interpolated_voltages.append(f)
+
+    if interpolated_voltages:
+        t = np.linspace(0, min_cycle_duration, NUM_POINTS)
+        arr = [f(t) for f in interpolated_voltages]
+
+        v = np.mean(arr, axis=0)
+        v = np.clip(v, CUTOFF_VOLTAGE, None)
+        v = uniform_filter1d(v, size=20)
+
+        for ti, vi in zip(t, v):
+            all_features.append([ti, float(current.replace("A", ""))])
+            all_targets.append(vi)
+            labels.append(current)
+
+# ================= PREPARE =================
+X = np.array(all_features)
+y = np.array(all_targets).reshape(-1, 1)
+
+scaler_X = MinMaxScaler()
+scaler_y = MinMaxScaler()
+
+X_scaled = scaler_X.fit_transform(X)
+y_scaled = scaler_y.fit_transform(y)
+
+X_train, X_test, y_train, y_test, label_train, label_test = train_test_split(
+    X_scaled, y_scaled, labels, test_size=0.2, random_state=42
+)
+
+# ================= VQR MODEL =================
+param_x = Parameter("x")
+feature_map = QuantumCircuit(1)
+feature_map.ry(param_x, 0)
+
+param_y = Parameter("y")
+ansatz = QuantumCircuit(1)
+ansatz.ry(param_y, 0)
+
+estimator = Estimator()
+
+vqr = VQR(
+    feature_map=feature_map,
+    ansatz=ansatz,
+    optimizer=L_BFGS_B(maxiter=200),
+    estimator=estimator
+)
+
+# Train
+vqr.fit(X_train[:, [0]], y_train.ravel())
+
+# Predict
+y_pred = vqr.predict(X_test[:, [0]])
+y_pred = scaler_y.inverse_transform(y_pred.reshape(-1, 1))
+y_true = scaler_y.inverse_transform(y_test)
+
+# ================= PCA (GLOBAL INTERPRETABILITY) =================
+X_pca_input = np.hstack((X_test, y_pred))
+pca = PCA(n_components=2)
+X_pca = pca.fit_transform(X_pca_input)
+explained_var = pca.explained_variance_ratio_
+
+plt.figure(figsize=(8, 6))
+unique_labels = list(set(label_test))
+
+for label in unique_labels:
+    idx = np.array(label_test) == label
+    plt.scatter(X_pca[idx, 0], X_pca[idx, 1], label=label, s=10, alpha=0.7)
+
+plt.xlabel(f"PC1 ({explained_var[0]*100:.1f}%)")
+plt.ylabel(f"PC2 ({explained_var[1]*100:.1f}%)")
+plt.title("PCA Projection of QNN Outputs (Global View)")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# ================= FEATURE IMPORTANCE =================
+def permutation_importance(model, X, y_true):
+    baseline_pred = model.predict(X[:, [0]])
+    baseline_pred = scaler_y.inverse_transform(baseline_pred.reshape(-1,1))
+    baseline_mse = mean_squared_error(y_true, baseline_pred)
+
+    importances = []
+
+    for col in range(X.shape[1]):
+        X_permuted = X.copy()
+        np.random.shuffle(X_permuted[:, col])
+
+        perm_pred = model.predict(X_permuted[:, [0]])
+        perm_pred = scaler_y.inverse_transform(perm_pred.reshape(-1,1))
+        perm_mse = mean_squared_error(y_true, perm_pred)
+
+        importances.append(perm_mse - baseline_mse)
+
+    return importances
+
+importances = permutation_importance(vqr, X_test, y_true)
+
+print("\nFeature Importance:")
+print(f"Time Importance: {importances[0]:.6f}")
+print(f"Current Importance: {importances[1]:.6f}")
+
+# ================= SENSITIVITY ANALYSIS =================
+def sensitivity_analysis(model, X_sample, epsilon=1e-2):
+    sensitivities = []
+
+    for i in range(len(X_sample)):
+        x = X_sample[i].copy()
+
+        y0 = model.predict(x.reshape(1,-1)[:, [0]])
+
+        x_perturbed = x.copy()
+        x_perturbed[0] += epsilon
+
+        y1 = model.predict(x_perturbed.reshape(1,-1)[:, [0]])
+
+        sensitivity = np.abs(y1 - y0)
+        sensitivities.append(sensitivity[0])
+
+    return np.array(sensitivities)
+
+sens = sensitivity_analysis(vqr, X_test[:500])
+
+plt.figure(figsize=(8,5))
+plt.plot(sens)
+plt.title("Quantum Circuit Sensitivity (Local Interpretability)")
+plt.xlabel("Sample Index")
+plt.ylabel("Sensitivity")
+plt.grid(True)
+plt.show()
