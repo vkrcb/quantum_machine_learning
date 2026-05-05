@@ -1,0 +1,270 @@
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import statsmodels.api as sm
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import KFold
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from qiskit_machine_learning.optimizers import L_BFGS_B
+from qiskit_machine_learning.neural_networks import EstimatorQNN
+from qiskit_machine_learning.algorithms import NeuralNetworkRegressor
+from qiskit.primitives import Estimator
+from qiskit.circuit import Parameter, QuantumCircuit
+from scipy.interpolate import interp1d
+from matplotlib.font_manager import FontProperties
+
+
+# === Set Global Roman Bold Style for All Text Elements ===
+plt.rcParams['font.family'] = 'Times New Roman'
+plt.rcParams['font.weight'] = 'bold'
+plt.rcParams['xtick.labelsize'] = 12
+plt.rcParams['ytick.labelsize'] = 12
+
+# === Roman Bold FontProperties for Titles and Legends ===
+roman_bold = FontProperties(family='Times New Roman', weight='bold')
+
+
+# CONFIG
+DATA_DIR = '/home/ashok/Documents/battery_alt_dataset/battery_alt_dataset/regular_alt_batteries'
+battery_map = {
+    '9.3A': ['battery01.csv', 'battery11.csv'],
+    '12.9A': ['battery31.csv', 'battery22.csv'],
+    '14.3A': ['battery23.csv', 'battery52.csv'],
+    '16.0A': ['battery00.csv', 'battery10.csv'],
+    '19.0A': ['battery20.csv', 'battery30.csv']
+}
+color_list = ['tab:blue', 'tab:orange', 'tab:green', 'tab:red', 'tab:purple']
+ci_alpha = 0.18
+# Compute energy and capacity metrics
+def compute_metrics(df):
+    t = df['time'].values
+    I = df['current_load'].values
+    V = df['voltage_load'].values
+    energy = np.trapz(V * I, t) / 3600 / 1000  # kWh
+    capacity = np.trapz(I, t) / 3600           # Ah
+    return energy, capacity
+
+results = []
+initial_capacities = []
+# Process each battery file
+for current_label, battery_files in battery_map.items():
+    for file in battery_files:
+        df = pd.read_csv(os.path.join(DATA_DIR, file))
+        df = df[df['mode'] == -1].copy()
+        df = df.sort_values('time').reset_index(drop=True)
+        df['time_diff'] = df['time'].diff().fillna(0)
+        df['cycle'] = (df['time_diff'] > 60).cumsum()
+        cumulative_energy = 0
+        first_valid_capacity = None
+        # Group by cycle and compute metrics
+        for _, group in df.groupby('cycle'):
+            if len(group) < 10:
+                continue
+            t_start = group['time'].iloc[0]
+            t_end = group['time'].iloc[-1]
+            duration = t_end - t_start
+            energy, capacity = compute_metrics(group)
+            if duration < 300 or capacity < 0.1 or energy < 0.001:
+                continue
+            if group['voltage_load'].max() - group['voltage_load'].min() < 0.2:
+                continue
+            if first_valid_capacity is None:
+                first_valid_capacity = capacity
+                initial_capacities.append(first_valid_capacity)
+            cumulative_energy += energy
+            results.append({
+                'current': current_label,
+                'cumulative_energy': cumulative_energy,
+                'capacity': capacity,
+                'initial_capacity': first_valid_capacity
+            })
+
+mean_initial_capacity = np.mean(initial_capacities)
+results_df = pd.DataFrame(results)
+#
+cleaned_dfs = []
+# Process each current and smooth capacity
+for current in results_df['current'].unique():
+    df_sub = results_df[results_df['current'] == current].sort_values('cumulative_energy').reset_index(drop=True)
+    df_sub = df_sub[df_sub['cumulative_energy'].diff().fillna(1) > 0]
+    df_sub['capacity_aligned'] = df_sub['capacity'] - df_sub['initial_capacity'] + mean_initial_capacity
+    if current in ['16.0A', '19.0A']:
+        frac = 0.25
+    else:
+        frac = 0.12
+    smoothed = sm.nonparametric.lowess(df_sub['capacity_aligned'], df_sub['cumulative_energy'], frac=frac)
+    df_sub['capacity_smooth'] = smoothed[:, 1]
+    cleaned_dfs.append(df_sub)
+
+# SINGLE FIGURE
+fig, ax = plt.subplots(figsize=(10, 6))
+
+random_seed = 42
+
+r2_table = {}
+# Iterate through each cleaned DataFrame
+for idx, df_sub in enumerate(cleaned_dfs):
+    current = df_sub['current'].iloc[0]
+    color = color_list[idx % len(color_list)]
+    df_vqr = df_sub.copy()
+    df_vqr = df_vqr.reset_index(drop=True)
+    df_vqr['cycle'] = df_vqr.index.values
+    df_vqr['current_numeric'] = df_vqr['current'].str.replace('A', '').astype(float)
+    # FEATURES AND TARGET
+    X = df_vqr[['cumulative_energy', 'current_numeric']].values
+    y = df_vqr['capacity_smooth'].values
+
+    # Initialize metrics lists for each current
+    mae_scores_train = []
+    rmse_scores_train = []
+    r2_scores_train = []
+    mae_scores_test = []
+    rmse_scores_test = []
+    r2_scores_test = []
+
+    # Initialize lists to collect predictions for CI
+    preds = []
+    x_tests = []
+
+
+    
+    # Split data into training and test sets
+    n_samples = X.shape[0]
+    n_test = int(np.ceil(0.2 * n_samples))
+    n_train = n_samples - n_test
+    indices = np.arange(n_samples)
+    np.random.seed(random_seed)
+    np.random.shuffle(indices)
+    train_idx, test_idx = indices[:n_train], indices[n_train:]
+    X_train, X_test = X[train_idx], X[test_idx]
+    y_train, y_test = y[train_idx], y[test_idx]
+    scaler = MinMaxScaler(feature_range=(-1, 1))
+    # Scale features and target variable
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+    yscaler = MinMaxScaler(feature_range=(-1, 1))
+    y_train_scaled = yscaler.fit_transform(y_train.reshape(-1, 1)).flatten()
+    y_test_scaled = yscaler.transform(y_test.reshape(-1, 1)).flatten()
+    # Define the quantum circuit for the regression model
+    # Feature map and ansatz
+    param_x1 = Parameter("x1")
+    param_x2 = Parameter("x2")
+    feature_map = QuantumCircuit(2, name="fm")
+    feature_map.ry(param_x1, 0)
+    feature_map.ry(param_x2, 1)
+    # Variational ansatz
+    # Define the ansatz circuit
+    param_y1 = Parameter("y1")
+    param_y2 = Parameter("y2")
+    ansatz = QuantumCircuit(2, name="vf")
+    ansatz.ry(param_y1, 0)
+    ansatz.ry(param_y2, 1)
+    # Combine feature map and ansatz into a single circuit
+    # Define the quantum circuit
+    qc = QuantumCircuit(2)
+    qc.compose(feature_map, inplace=True)
+    qc.compose(ansatz, inplace=True)
+    # Define input and weight parameters
+    input_params = [param_x1, param_x2]
+    weight_params = [param_y1, param_y2]
+    # Create the EstimatorQNN
+    estimator = Estimator()
+    # Create the EstimatorQNN for regression
+    regression_estimator_qnn = EstimatorQNN(
+                circuit=qc,
+                input_params=input_params,
+                weight_params=weight_params,
+                estimator=estimator
+            )
+    regressor = NeuralNetworkRegressor(
+                neural_network=regression_estimator_qnn,
+                loss="squared_error",
+                optimizer=L_BFGS_B(maxiter=200),
+            ) 
+    # Fit the regressor on the training set
+    regressor.fit(X_train_scaled, y_train_scaled)
+    # Predict on training set
+    y_train_pred_scaled = regressor.predict(X_train_scaled)
+    y_train_pred = yscaler.inverse_transform(y_train_pred_scaled.reshape(-1, 1)).flatten()
+    # Predict on test set
+    y_test_pred_scaled = regressor.predict(X_test_scaled)
+    y_test_pred = yscaler.inverse_transform(y_test_pred_scaled.reshape(-1, 1)).flatten()
+    preds.append(y_test_pred)
+    x_tests.append(X_test[:, 0])
+
+    # Store predictions and metrics
+    mae_scores_train.append(mean_absolute_error(y_train, y_train_pred))
+    rmse_scores_train.append(np.sqrt(mean_squared_error(y_train, y_train_pred)))
+    r2_scores_train.append(r2_score(y_train, y_train_pred))
+    mae_scores_test.append(mean_absolute_error(y_test, y_test_pred))
+    rmse_scores_test.append(np.sqrt(mean_squared_error(y_test, y_test_pred)))
+    r2_scores_test.append(r2_score(y_test, y_test_pred))
+    
+    # --- AGGREGATE PREDICTIONS FOR CI ---
+    # Interpolate all predictions onto a dense grid for CI calculation
+    all_x = np.concatenate(x_tests)
+    all_y = np.concatenate(preds)
+    sort_idx = np.argsort(all_x)
+    all_x_sorted = all_x[sort_idx]
+    all_y_sorted = all_y[sort_idx]
+
+    # Define a dense grid over the range of cumulative_energy
+    x_dense = np.linspace(np.min(all_x_sorted), np.max(all_x_sorted), 300)
+    # For each fold, interpolate predictions onto x_dense
+    interp_preds = []
+    for xi, yi in zip(x_tests, preds):
+        if len(xi) < 2:
+            continue
+        interp_fn = interp1d(xi, yi, kind='linear', bounds_error=False, fill_value='extrapolate')
+        interp_preds.append(interp_fn(x_dense))
+    interp_preds = np.array(interp_preds)
+    # Compute mean and std at each grid point (be robust to <2 folds)
+    if interp_preds.size == 0:
+        y_pred_dense = np.full_like(x_dense, np.nan)
+        pred_std = np.zeros_like(x_dense)
+        valid_counts = np.zeros_like(x_dense, dtype=int)
+    else:
+        # axis=0: folds, axis=1: grid points
+        y_pred_dense = np.nanmean(interp_preds, axis=0)
+        pred_std = np.nanstd(interp_preds, axis=0)
+        valid_counts = np.sum(~np.isnan(interp_preds), axis=0)
+
+    #  MINIMUM CI WIDTH ---
+    MIN_CI = 0.03  # Minimum half-width in Ah; adjust as needed for visibility
+    ci_hw = 1.96 * pred_std
+    ci_hw = np.maximum(ci_hw, MIN_CI)
+    # Use >=1 to show CI even when only one fold contributes (more visible)
+    lower = np.where(valid_counts >= 1, y_pred_dense - ci_hw, np.nan)
+    upper = np.where(valid_counts >= 1, y_pred_dense + ci_hw, np.nan)
+    r2_table[current] = (np.mean(r2_scores_train), np.mean(r2_scores_test))
+    print(f"{current} - Train: MAE={np.mean(mae_scores_train):.4f}, RMSE={np.mean(rmse_scores_train):.4f}, R2={np.mean(r2_scores_train):.4f} | "
+          f"Test: MAE={np.mean(mae_scores_test):.4f}, RMSE={np.mean(rmse_scores_test):.4f}")
+    # Plot mean function (actual, solid)
+    ax.plot(df_vqr['cumulative_energy'], df_vqr['capacity_smooth'], color=color, linestyle='-', linewidth=4,
+            label=f"{current} ")
+    # Plot predicted mean (dashed) if available
+    if not np.all(np.isnan(y_pred_dense)):
+        ax.plot(x_dense, y_pred_dense, color=color, linestyle='--', linewidth=2)
+
+    # Plot CI (shaded) only where available
+    if not np.all(np.isnan(lower)) and not np.all(np.isnan(upper)):
+        ax.fill_between(x_dense, lower, upper, color=color, alpha=ci_alpha)
+
+ax.set_xlabel("Cumulative energy [kWh]", fontsize=13)
+ax.set_ylabel("Capacity [Ah]", fontsize=13)
+plt.rcParams['font.family'] = 'serif'
+plt.rcParams['font.serif'] = ['Times New Roman'] # Set Roman font globally
+ax.tick_params(axis='both', labelsize=12) 
+bold_font = {'fontweight': 'bold'}
+ax.set_xticklabels([item.get_text() for item in ax.get_xticklabels()], **bold_font)
+ax.set_yticklabels([item.get_text() for item in ax.get_yticklabels()], **bold_font)
+
+ax.grid(True, linestyle='--', alpha=0.4)
+ax.legend(fontsize=12, ncol=2, prop=roman_bold)
+plt.tight_layout()
+plt.show()
+
+print("| Current | Train R2 | Test R2 |")
+for k, (r2tr, r2te) in r2_table.items():
+    print(f"| {k:>6} | {r2tr:7.4f} | {r2te:7.4f} |")
