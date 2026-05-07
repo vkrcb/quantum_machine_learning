@@ -1,0 +1,147 @@
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.signal import savgol_filter
+from sklearn.model_selection import train_test_split, KFold
+from sklearn.metrics import r2_score
+from sklearn.preprocessing import MinMaxScaler
+from qiskit.primitives import Estimator
+from qiskit import QuantumCircuit
+from qiskit.circuit import Parameter
+from qiskit_machine_learning.algorithms.regressors import VQR
+from qiskit_machine_learning.optimizers import L_BFGS_B
+from matplotlib.font_manager import FontProperties
+
+# ---------------- STYLE ----------------
+plt.rcParams["font.family"] = "serif"
+plt.rcParams["font.serif"] = ["Times New Roman"]
+plt.rcParams["axes.labelweight"] = "bold"
+roman_bold = FontProperties(family="Times New Roman", weight="bold", size=12)
+
+# ---------------- CONFIG ----------------
+base_path = "/home/ashok/Documents/battery_alt_dataset/battery_alt_dataset/regular_alt_batteries"
+csv_files = [
+    "battery40.csv",
+    "battery50.csv",
+    "battery41.csv",
+    "battery51.csv",
+]
+labels = ["Battery 1", "Battery 2", "Battery 3", "Battery 4"]
+LOAD_CONDITIONS = [(16, 19), (12.9, 16)]
+TIME_LIMIT = 1000
+estimator = Estimator()
+
+# ===================== PANEL LEARNING CURVES (2x2) =====================
+
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+axes = axes.flatten()
+
+for idx, file in enumerate(csv_files):
+
+    path = os.path.join(base_path, file)
+    if not os.path.exists(path):
+        continue
+
+    df = pd.read_csv(path)
+    df.dropna(subset=["current_load", "voltage_load"], inplace=True)
+
+    load_min, load_max = LOAD_CONDITIONS[0] if idx < 2 else LOAD_CONDITIONS[1]
+
+    df = df[
+        (df["current_load"] >= load_min) &
+        (df["current_load"] <= load_max) &
+        (df["mode"] == -1)
+    ].copy()
+
+    df = df[df["time"] < df["time"].min() + TIME_LIMIT]
+    df["elapsed_time"] = df["time"] - df["time"].min()
+
+    if len(df) < 50:
+        continue
+
+    if len(df) >= 11:
+        df["voltage_load"] = savgol_filter(df["voltage_load"], 11, 2)
+
+    # ---------- FEATURES ----------
+    X = df[["elapsed_time", "current_load"]].values
+    y = df["voltage_load"].values
+
+    scaler_X = MinMaxScaler()
+    scaler_y = MinMaxScaler()
+
+    X_scaled = scaler_X.fit_transform(X)
+    y_scaled = scaler_y.fit_transform(y.reshape(-1, 1)).ravel()
+
+    X_train, _, y_train, _ = train_test_split(
+        X_scaled, y_scaled, test_size=0.2, random_state=42
+    )
+
+    # ---------- LEARNING CURVE + 20-FOLD CV ----------
+    train_fracs = np.linspace(0.2, 1.0, 8)
+    train_sizes, train_scores, test_scores = [], [], []
+
+    kf = KFold(n_splits=20, shuffle=True, random_state=42)
+
+    for frac in train_fracs:
+
+        n_samples = int(len(X_train) * frac)
+        if n_samples < 40:
+            continue
+
+        X_sub = X_train[:n_samples]
+        y_sub = y_train[:n_samples]
+        train_sizes.append(n_samples)
+
+        fold_train_r2, fold_test_r2 = [], []
+
+        for tr_idx, val_idx in kf.split(X_sub):
+
+            X_tr, X_val = X_sub[tr_idx], X_sub[val_idx]
+            y_tr, y_val = y_sub[tr_idx], y_sub[val_idx]
+
+            if len(y_val) < 2:
+                continue
+
+            # ---- VQR MODEL ----
+            x1, x2 = Parameter("x1"), Parameter("x2")
+            y1, y2 = Parameter("y1"), Parameter("y2")
+
+            feature_map = QuantumCircuit(2)
+            feature_map.ry(x1, 0)
+            feature_map.ry(x2, 1)
+
+            ansatz = QuantumCircuit(2)
+            ansatz.ry(y1, 0)
+            ansatz.ry(y2, 1)
+
+            vqr = VQR(
+                feature_map=feature_map,
+                ansatz=ansatz,
+                optimizer=L_BFGS_B(maxiter=200),
+                estimator=estimator,
+            )
+
+            vqr.fit(X_tr, y_tr)
+
+            fold_train_r2.append(r2_score(y_tr, vqr.predict(X_tr)))
+            fold_test_r2.append(r2_score(y_val, vqr.predict(X_val)))
+
+        train_scores.append(np.mean(fold_train_r2))
+        test_scores.append(np.mean(fold_test_r2))
+
+    # ---------- PLOT ON PANEL ----------
+    ax = axes[idx]
+    ax.plot(train_sizes, train_scores, "o-", lw=2.5, label="Train R²")
+    ax.plot(train_sizes, test_scores, "s--", lw=2.5, label="Test R²")
+
+    ax.set_title(f"Learning Curve – {labels[idx]}", fontproperties=roman_bold)
+    
+    ax.set_xlabel("Training Samples", fontproperties=roman_bold)
+    ax.set_ylabel("R² Score", fontproperties=roman_bold)
+    ax.grid(True, linestyle="--", alpha=0.6)
+    ax.legend(prop=roman_bold)
+
+# ---------- FINAL LAYOUT ----------
+plt.tight_layout()
+plt.show()
