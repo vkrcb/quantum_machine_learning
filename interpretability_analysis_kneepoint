@@ -1,0 +1,205 @@
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.signal import savgol_filter
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler
+
+from qiskit.primitives import Estimator
+from qiskit import QuantumCircuit
+from qiskit.circuit import Parameter
+from qiskit_machine_learning.algorithms.regressors import VQR
+from qiskit_machine_learning.optimizers import L_BFGS_B
+
+# -----------------------------
+# 🔹 Styling
+# -----------------------------
+plt.rcParams["font.family"] = "serif"
+plt.rcParams["font.serif"] = ["Times New Roman"]
+
+# -----------------------------
+# 🔹 File Paths
+# -----------------------------
+base_path = "/home/ashok/Documents/battery_alt_dataset/battery_alt_dataset/regular_alt_batteries"
+csv_files = [
+    os.path.join(base_path, "battery40.csv"),
+    os.path.join(base_path, "battery50.csv"),
+    os.path.join(base_path, "battery41.csv"),
+    os.path.join(base_path, "battery51.csv"),
+]
+labels = ["Battery 1", "Battery 2", "Battery 3", "Battery 4"]
+
+LOAD_CONDITIONS = [(16, 19), (12.9, 16)]
+TIME_LIMIT = 1000
+
+# =============================
+# 🔹 MAIN LOOP
+# =============================
+for battery_idx, file_path in enumerate(csv_files):
+
+    if not os.path.exists(file_path):
+        continue
+
+    df = pd.read_csv(file_path)
+    df.dropna(subset=["current_load", "voltage_load"], inplace=True)
+
+    load_min, load_max = LOAD_CONDITIONS[0] if battery_idx < 2 else LOAD_CONDITIONS[1]
+
+    df_filtered = df[
+        (df["current_load"] >= load_min) &
+        (df["current_load"] <= load_max) &
+        (df["mode"] == -1)
+    ].copy()
+
+    if df_filtered.empty:
+        continue
+
+    df_filtered = df_filtered[df_filtered["time"] < df_filtered["time"].min() + TIME_LIMIT]
+    df_filtered["elapsed_time"] = df_filtered["time"] - df_filtered["time"].min()
+
+    if len(df_filtered) >= 11:
+        df_filtered["voltage_load"] = savgol_filter(df_filtered["voltage_load"], 11, 2)
+
+    # -----------------------------
+    # 🔹 ML DATA
+    # -----------------------------
+    features = df_filtered[["elapsed_time", "current_load"]].values
+    target = df_filtered["voltage_load"].values
+
+    scaler_X = MinMaxScaler()
+    scaler_y = MinMaxScaler()
+
+    X_scaled = scaler_X.fit_transform(features)
+    y_scaled = scaler_y.fit_transform(target.reshape(-1, 1)).flatten()
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_scaled, y_scaled, test_size=0.2, random_state=42
+    )
+
+    # -----------------------------
+    # 🔹 VQR MODEL
+    # -----------------------------
+    param_x1, param_x2 = Parameter("x1"), Parameter("x2")
+    param_y1, param_y2 = Parameter("y1"), Parameter("y2")
+
+    feature_map = QuantumCircuit(2)
+    feature_map.ry(param_x1, 0)
+    feature_map.ry(param_x2, 1)
+
+    ansatz = QuantumCircuit(2)
+    ansatz.ry(param_y1, 0)
+    ansatz.ry(param_y2, 1)
+
+    vqr = VQR(
+        feature_map=feature_map,
+        ansatz=ansatz,
+        optimizer=L_BFGS_B(maxiter=200),
+        estimator=Estimator()
+    )
+
+    vqr.fit(X_train, y_train)
+
+    # -----------------------------
+    # 🔹 Predictions
+    # -----------------------------
+    y_full = vqr.predict(scaler_X.transform(features))
+    y_full_rescaled = scaler_y.inverse_transform(y_full.reshape(-1,1)).flatten()
+    error_full = np.abs(df_filtered["voltage_load"].values - y_full_rescaled)
+
+    # 🔹 dV/dQ
+    time = df_filtered["elapsed_time"].values
+    voltage = df_filtered["voltage_load"].values
+    current = df_filtered["current_load"].values
+    dV_dt = np.gradient(voltage, time)
+    current_safe = np.where(current == 0, 1e-6, current)
+    dV_dQ = dV_dt / current_safe
+
+    # 🔹 Resistance
+    R_internal = np.abs(np.gradient(voltage) / current_safe)
+
+    # 🔹 Knee Point
+    d2V = np.gradient(dV_dt, time)
+    knee_idx = np.argmax(np.abs(d2V))
+    knee_time = time[knee_idx]
+
+    # -----------------------------
+    # 🔹 Mask unrealistic spikes
+    # -----------------------------
+    mask = (np.abs(dV_dQ) < 1e3) & (R_internal < 1e3)
+    error_full_masked = error_full[mask]
+    dV_dQ_masked = np.abs(dV_dQ[mask])
+    R_internal_masked = R_internal[mask]
+    time_masked = time[mask]
+
+    # -----------------------------
+    # 🔹 Correlation Calculation
+    # -----------------------------
+    corr_dvdq = np.corrcoef(error_full_masked, dV_dQ_masked)[0,1]
+    corr_res = np.corrcoef(error_full_masked, R_internal_masked)[0,1]
+    corr_dvdq_R = np.corrcoef(dV_dQ_masked, R_internal_masked)[0,1]
+
+    print(f"{labels[battery_idx]} | Corr(Error, dV/dQ)={corr_dvdq:.3f} | Corr(Error, Resistance)={corr_res:.3f} | Corr(dV/dQ vs R)={corr_dvdq_R:.3f}")
+
+    # -----------------------------
+    # 🔹 Combined Interpretability Figure
+    # -----------------------------
+    fig, axs = plt.subplots(1, 3, figsize=(18,5))
+    fig.suptitle(f"{labels[battery_idx]}: Interpretability Analysis", fontsize=14, fontweight='bold')
+
+    # (1) Error vs dV/dQ
+    bins_dvdq = np.logspace(np.log10(np.min(dV_dQ_masked+1e-6)),
+                            np.log10(np.max(dV_dQ_masked+1e-6)), 20)
+    digitized_dvdq = np.digitize(dV_dQ_masked, bins_dvdq)
+    bin_means_dvdq, bin_centers_dvdq = [], []
+    for i in range(1, len(bins_dvdq)):
+        vals = error_full_masked[digitized_dvdq == i]
+        if len(vals) > 0:
+            bin_means_dvdq.append(vals.mean())
+            bin_centers_dvdq.append((bins_dvdq[i-1] + bins_dvdq[i]) / 2)
+    if len(bin_means_dvdq) > 5:
+        bin_means_dvdq = savgol_filter(bin_means_dvdq, 5, 2)
+    axs[0].plot(bin_centers_dvdq, bin_means_dvdq, 'o-', color='blue')
+    axs[0].set_xscale('log')
+    axs[0].set_xlabel("|dV/dQ|")
+    axs[0].set_ylabel("Mean Prediction Error")
+    axs[0].set_title(f"Error vs dV/dQ\nCorr={corr_dvdq:.2f}")
+    axs[0].grid(True)
+
+    # (2) Error vs Resistance
+    bins_res = np.logspace(np.log10(np.min(R_internal_masked+1e-6)),
+                           np.log10(np.max(R_internal_masked+1e-6)), 20)
+    digitized_res = np.digitize(R_internal_masked, bins_res)
+    bin_means_res, bin_centers_res = [], []
+    for i in range(1, len(bins_res)):
+        vals = error_full_masked[digitized_res == i]
+        if len(vals) > 0:
+            bin_means_res.append(vals.mean())
+            bin_centers_res.append((bins_res[i-1] + bins_res[i]) / 2)
+    if len(bin_means_res) > 5:
+        bin_means_res = savgol_filter(bin_means_res, 5, 2)
+    axs[1].plot(bin_centers_res, bin_means_res, 'o-', color='green')
+    axs[1].set_xscale('log')
+    axs[1].set_xlabel("Internal Resistance")
+    axs[1].set_ylabel("Mean Prediction Error")
+    axs[1].set_title(f"Error vs Resistance\nCorr={corr_res:.2f}")
+    axs[1].grid(True)
+
+    # (3) Error vs Knee Point Degradation
+    error_before_knee = error_full[time < knee_time]
+    error_after_knee  = error_full[time >= knee_time]
+    mean_error_before = np.mean(error_before_knee)
+    mean_error_after  = np.mean(error_after_knee)
+
+    axs[2].plot(time, error_full, color='blue', lw=2, label="Error")
+    axs[2].axvline(knee_time, linestyle='--', color='red', label="Knee Point")
+    axs[2].axhline(mean_error_before, linestyle=':', color='green', label=f"Mean Before={mean_error_before:.3f}")
+    axs[2].axhline(mean_error_after, linestyle=':', color='orange', label=f"Mean After={mean_error_after:.3f}")
+    axs[2].set_xlabel("Time [s]")
+    axs[2].set_ylabel("Prediction Error")
+    axs[2].set_title("Error vs Knee Point Degradation")
+    axs[2].legend()
+    axs[2].grid(True)
+
+    plt.tight_layout()
+    plt.show()
