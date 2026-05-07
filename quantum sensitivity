@@ -38,7 +38,7 @@ color_map = {
 NUM_POINTS = 30000
 CUTOFF_VOLTAGE = 5
 
-# === ⚛️ Quantum Parameter-Shift Sensitivity ===
+# Quantum Parameter-Shift Sensitivity ===
 def quantum_sensitivity(model, x, shift=np.pi/2):
     x = np.array(x, dtype=float)
     weights = model._fit_result.x.copy()
@@ -168,7 +168,7 @@ for current, files in battery_map.items():
 
     sensitivity_summary[current] = norm_sens
 
-    # 👉 FIX: use mean over all θ parameters
+    # FIX: use mean over all θ parameters
     scatter_data[current] = (
         np.array(energies),
         np.mean(sens_array, axis=1)
