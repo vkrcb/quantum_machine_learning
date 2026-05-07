@@ -1,0 +1,153 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from qiskit import QuantumCircuit
+from qiskit.circuit import Parameter
+
+from qiskit_machine_learning.algorithms import VQR
+from qiskit_machine_learning.optimizers import L_BFGS_B
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from scipy.signal import savgol_filter
+from qiskit.primitives import Estimator
+
+# Globally set font to serif (Roman style) and bold
+plt.rcParams.update({
+    "font.family": "serif",
+    "font.weight": "bold",
+    "axes.labelweight": "bold",
+    "axes.titleweight": "bold",
+    "axes.titlesize": "medium",
+    "xtick.labelsize": "medium",
+    "ytick.labelsize": "medium",
+    "xtick.direction": "in",
+    "ytick.direction": "in"
+})
+
+from matplotlib.font_manager import FontProperties
+roman_bold = FontProperties(family='serif', weight='bold',size=12)
+# --- Load Data ---
+file_path = r'/home/user/Desktop/Documents/battery_alt_dataset/battery_alt_dataset/regular_alt_batteries/battery41.csv'
+df = pd.read_csv(file_path)
+
+# --- Preprocess ---
+df['time_hours'] = df['time'] / 3600
+df_discharge = df[df['mode'] == -1].copy()
+df_discharge['time_diff'] = df_discharge['time'].diff().fillna(0)
+df_discharge['cycle_index'] = (df_discharge['time_diff'] > 50).cumsum()
+df_discharge = df_discharge[(df_discharge['current_load'] >= 12.9) & (df_discharge['current_load'] <= 16)]
+
+# Derived features
+df_discharge['voltage_diff'] = df_discharge['voltage_load'].diff().fillna(0)
+df_discharge['load_diff'] = df_discharge['current_load'].diff().fillna(0)
+df_discharge['elapsed_time'] = df_discharge.groupby('cycle_index')['time_hours'].transform(lambda x: x - x.min())
+
+# --- Features and Target ---
+features = ['time_hours', 'current_load', 'cycle_index', 'voltage_diff', 'load_diff', 'elapsed_time']
+target = 'voltage_load'
+
+# --- Scaling ---
+scaler_X = MinMaxScaler()
+scaler_y = MinMaxScaler()
+X = scaler_X.fit_transform(df_discharge[features])
+y = scaler_y.fit_transform(df_discharge[[target]])
+
+# --- Train/Test Split by cycle ---
+cycle_split = 80
+train_mask = df_discharge['cycle_index'] < cycle_split
+test_mask = df_discharge['cycle_index'] >= cycle_split
+X_train, X_test = X[train_mask], X[test_mask]
+y_train, y_test = y[train_mask], y[test_mask]
+
+# --- Quantum Model ---
+param_x = [Parameter(f"x{i}") for i in range(6)]
+feature_map = QuantumCircuit(6, name="fm")
+for idx, p in enumerate(param_x):
+    feature_map.ry(p, idx)
+
+param_y = [Parameter(f"y{i}") for i in range(6)]
+ansatz = QuantumCircuit(6, name="vf")
+for idx, p in enumerate(param_y):
+    ansatz.ry(p, idx)
+
+estimator = Estimator()
+vqr = VQR(
+    feature_map=feature_map,
+    ansatz=ansatz,
+    optimizer=L_BFGS_B(maxiter=100),
+)
+
+# --- Train VQR ---
+vqr.fit(X_train, y_train.ravel())
+
+# --- Predict ---
+y_pred_train = vqr.predict(X_train)
+y_pred_test = vqr.predict(X_test)
+
+# --- Rescale ---
+y_pred_train_rescaled = scaler_y.inverse_transform(y_pred_train.reshape(-1, 1)).flatten()
+y_pred_test_rescaled = scaler_y.inverse_transform(y_pred_test.reshape(-1, 1)).flatten()
+y_test_rescaled = scaler_y.inverse_transform(y_test.reshape(-1, 1)).flatten()
+
+# --- Add predictions to dataframe ---
+df_discharge['predicted_voltage'] = np.nan
+train_idx = train_mask.index[train_mask]
+test_idx = test_mask.index[test_mask]
+df_discharge.loc[train_idx, 'predicted_voltage'] = y_pred_train_rescaled
+df_discharge.loc[test_idx, 'predicted_voltage'] = y_pred_test_rescaled
+
+# --- Smoothing ---
+def apply_smoothing(group):
+    if len(group) >= 17:
+        smoothed = savgol_filter(group['predicted_voltage'], window_length=17, polyorder=3)
+        return pd.Series(smoothed, index=group.index)
+    else:
+        return group['predicted_voltage']
+
+df_discharge['predicted_voltage_smooth'] = df_discharge.groupby('cycle_index').apply(apply_smoothing).reset_index(level=0, drop=True)
+
+# --- Cycle-wise Metrics (for selected cycles only) ---
+selected_cycles = [1, 21, 41, 61]
+cycle_metrics = []
+for cycle in selected_cycles:
+    df_cycle = df_discharge[df_discharge['cycle_index'] == cycle]
+    valid = df_cycle[['voltage_load', 'predicted_voltage_smooth']].dropna()
+    if len(valid) < 2:
+        continue
+    y_true = valid['voltage_load'].values
+    y_pred = valid['predicted_voltage_smooth'].values
+    mae = mean_absolute_error(y_true, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    r2 = r2_score(y_true, y_pred)
+    cycle_metrics.append({
+        'cycle_index': cycle,
+        'mae': mae,
+        'rmse': rmse,
+        'r2': r2,
+        'num_samples': len(valid)
+    })
+df_selected = pd.DataFrame(cycle_metrics)
+
+# --- Print metrics for each selected cycle ---
+print("\nCycle-wise Metrics (Cycles 1, 21, 41, 61):")
+for cycle in selected_cycles:
+    if cycle in df_selected['cycle_index'].values:
+        row = df_selected[df_selected['cycle_index'] == cycle].iloc[0]
+        print(f"\nCycle {int(row['cycle_index'])}:")
+        print(f"Length: {int(row['num_samples'])}")
+        print(f"MAE: {row['mae']:.4f} V")
+        print(f"RMSE: {row['rmse']:.4f} V")
+        print(f"R² Score: {row['r2']:.4f}")
+
+# --- Calculate and print panel (all selected cycles) average metrics ---
+mean_mae = df_selected['mae'].mean()
+mean_rmse = df_selected['rmse'].mean()
+mean_r2 = df_selected['r2'].mean()
+mean_len = df_selected['num_samples'].mean()
+
+print("\n=== Panel Average Metrics (Cycles 1, 21, 41, 61) ===")
+print(f"Avg MAE: {mean_mae:.4f} V")
+print(f"Avg RMSE: {mean_rmse:.4f} V")
+print(f"Avg R² Score: {mean_r2:.4f}")
+print(f"Avg Length: {mean_len:.0f}")
+
