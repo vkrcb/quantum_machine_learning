@@ -1,0 +1,134 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.model_selection import KFold
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import r2_score
+from qiskit.circuit import QuantumCircuit, Parameter
+from qiskit_machine_learning.algorithms.regressors import VQR
+from qiskit_machine_learning.optimizers import L_BFGS_B
+from qiskit.primitives import Estimator
+
+# --- Set up Plotting ---
+plt.rcParams["font.family"] = "serif"
+# Create the figure and axes based on subplot_info length
+fig, axes = plt.subplots(3, 3, figsize=(15, 12)) 
+axes = axes.flatten()
+
+battery_dir = "/home/ashok/Documents/battery_alt_dataset/battery_alt_dataset/regular_alt_batteries"
+
+subplot_info = [
+    {"label": "9.3A", "files": ["battery01.csv"], "kwh": 4},
+    {"label": "9.3A", "files": ["battery01.csv"], "kwh": 6},
+    {"label": "9.3A", "files": ["battery01.csv"], "kwh": 8},
+    {"label": "12.9A", "files": ["battery31.csv"], "kwh": 3},
+    {"label": "12.9A", "files": ["battery31.csv"], "kwh": 4},
+    {"label": "12.9A", "files": ["battery31.csv"], "kwh": 5},
+    {"label": "12.9–16A", "files": ["battery41.csv"], "kwh": 3},
+    {"label": "12.9–16A", "files": ["battery41.csv"], "kwh": 4},
+    {"label": "12.9–16A", "files": ["battery41.csv"], "kwh": 5},
+]
+
+def extract_cycles(df):
+    df = df[df['mode'] == -1].copy()
+    df = df[(df['voltage_load'] > 0) & (df['current_load'].abs() >= 0)].dropna(subset=['voltage_load', 'current_load'])
+    if df.empty: return []
+    is_new_cycle = (df['time'].diff() < 0) | (df['time'].diff() > 100)
+    df['cycle'] = is_new_cycle.cumsum()
+    cycles = []
+    cum_energy = 0.0
+    for _, group in df.groupby('cycle'):
+        time = group['time'].values - group['time'].values[0]
+        voltage = group['voltage_load'].values
+        current = np.abs(group['current_load'].values)
+        dt = np.diff(group['time'].values, prepend=group['time'].values[0])
+        power = voltage * current
+        energy = np.sum(power * dt) / 3600000
+        cum_energy += energy
+        if len(time) > 10 and (time[-1] > 50):
+            cycles.append({'time': time, 'cum_energy': cum_energy, 'group': group})
+    return cycles
+
+def calc_qmax(cycle):
+    dt = np.diff(cycle['group']['time'].values, prepend=cycle['group']['time'].values[0])
+    current = np.abs(cycle['group']['current_load'].values)
+    return np.sum(current * dt) / 3600
+
+# Iterate through each subplot info
+for idx, info in enumerate(subplot_info):
+    ax = axes[idx]
+    energies, qmaxs = [], []
+    
+    for fname in info["files"]:
+        path = os.path.join(battery_dir, fname)
+        if not os.path.exists(path): continue
+        df = pd.read_csv(path, low_memory=False)
+        cycles = extract_cycles(df)
+        first_qmax = None
+        for cyc in cycles:
+            if cyc['cum_energy'] > info['kwh']: break
+            q = calc_qmax(cyc)
+            if first_qmax is None: first_qmax = q
+            energies.append(cyc['cum_energy'])
+            qmaxs.append(q / first_qmax if first_qmax else 1)
+
+    if len(energies) < 10: # Ensure enough data for KFold
+        ax.set_title(f"{info['label']} - Insufficient Data")
+        continue
+
+    # Define X and y from extracted data
+    X = np.array(energies).reshape(-1, 1)
+    y = np.array(qmaxs)
+
+    # Scaling
+    sx, sy = MinMaxScaler(), MinMaxScaler()
+    Xs = sx.fit_transform(X)
+    ys = sy.fit_transform(y.reshape(-1, 1)).ravel()
+
+    train_sizes, train_scores, test_scores = [], [], []
+    fractions = np.linspace(0.2, 1.0, 5)
+    kf = KFold(n_splits=5, shuffle=True, random_state=42) # Reduced splits for stability
+
+    for frac in fractions:
+        n = int(len(Xs) * frac)
+        if n < 5: continue
+        X_sub, y_sub = Xs[:n], ys[:n]
+        train_sizes.append(n)
+        fold_tr, fold_te = [], []
+
+        for tr_idx, te_idx in kf.split(X_sub):
+            X_tr, X_te = X_sub[tr_idx], X_sub[te_idx]
+            y_tr, y_te = y_sub[tr_idx], y_sub[te_idx]
+
+            # Quantum Model (1 Qubit)
+            feature_param = Parameter("x")
+            ansatz_param = Parameter("y")
+            
+            fm = QuantumCircuit(1)
+            fm.ry(feature_param, 0)
+            ans = QuantumCircuit(1)
+            ans.ry(ansatz_param, 0)
+
+            vqr = VQR(
+                feature_map=fm,
+                ansatz=ans,
+                optimizer=L_BFGS_B(maxiter=50), # Lowered for speed
+                estimator=Estimator()
+            )
+
+            vqr.fit(X_tr, y_tr)
+            fold_tr.append(r2_score(y_tr, vqr.predict(X_tr)))
+            fold_te.append(r2_score(y_te, vqr.predict(X_te)))
+
+        train_scores.append(np.mean(fold_tr))
+        test_scores.append(np.mean(fold_te))
+
+    ax.plot(train_sizes, train_scores, "o-", lw=1.5, label="Train R²")
+    ax.plot(train_sizes, test_scores, "s--", lw=1.5, label="Test R²")
+    ax.set_title(f"{info['label']} ({info['kwh']} kWh)")
+    ax.grid(True, linestyle="--", alpha=0.6)
+    if idx == 0: ax.legend()
+
+plt.tight_layout()
+plt.show()
